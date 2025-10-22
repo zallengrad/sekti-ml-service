@@ -32,16 +32,6 @@ def fetch_all_user_metrics():
 def save_feedback_and_metrics(user_id, project_id, error_snapshot, code_snapshot, processed_data, performance, cluster):
     """Menyimpan data feedback dan metrik pengguna ke Supabase."""
     try:
-        # Simpan ke tabel feedback
-        supabase.table("ai_automated_feedbacks").upsert({
-            "user_id": user_id,
-            "project_id": project_id,
-            "error_snapshot": error_snapshot,
-            "code_snapshot": code_snapshot if code_snapshot else {},
-            "feedback_content": f"System classified performance as {performance}."
-        }).execute()
-
-        # Simpan metrik ke tabel user_metrics
         metric_data = {
             "user_id": user_id,
             "performance": performance,
