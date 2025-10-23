@@ -39,13 +39,26 @@ async def classify_user(data: UserData):
     Menerima data error pengguna, memprosesnya, dan mengklasisikasikan performa pengguna.
     """
     try:
-        # 1. Proses dan analisis error snapshot
-        processed_data = prediction_service.parse_and_prepare_data(data)
+        # 1. Simpan error snapshot terbaru
+        supabase_service.save_raw_error_snapshot(
+            user_id=data.user_id,
+            project_id=data.project_id,
+            error_snapshot=data.error_snapshot,
+            code_snapshot=data.code_snapshot
+        )
 
-        # 2. Lakukan prediksi performa
+        # 2. Ambil seluruh riwayat error untuk pengguna
+        history_records = supabase_service.fetch_user_error_history(data.user_id)
+        error_history = [record.get("error_snapshot") for record in history_records if record.get("error_snapshot")]
+        total_submissions = len(history_records)
+
+        # 3. Proses data riwayat menjadi agregat
+        processed_data = prediction_service.aggregate_and_prepare_data(error_history, total_submissions)
+
+        # 4. Lakukan prediksi performa
         performance, cluster_label = prediction_service.predict_performance(processed_data)
         
-        # 3. Simpan hasil ke Supabase
+        # 5. Simpan hasil ke Supabase
         supabase_service.save_feedback_and_metrics(
             user_id=data.user_id,
             project_id=data.project_id,

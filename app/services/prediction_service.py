@@ -31,6 +31,14 @@ weights = {
     'error_runtime_exception': 2.0,
     'error_illegal_start_of_type': 1.5
 }
+patterns = {
+    'error_cannot_find_symbol': r'cannot find symbol',
+    'error_semicolon_expected': r'; expected',
+    'error_runtime_exception': r'runtimeexception',
+    'error_constructor': r'constructor.*cannot be applied',
+    'error_identifier_expected': r'<identifier> expected',
+    'error_illegal_start_of_type': r'illegal start of type'
+}
 
 def load_model():
     """Memuat model dari file .pkl atau menginisialisasi model baru jika tidak ada."""
@@ -46,33 +54,36 @@ def load_model():
 
 def parse_and_prepare_data(data):
     """Mengekstrak fitur dari data mentah dan mempersiapkannya untuk model."""
-    patterns = {
-        'error_cannot_find_symbol': r'cannot find symbol',
-        'error_semicolon_expected': r'; expected',
-        'error_runtime_exception': r'RuntimeException',
-        'error_constructor': r'constructor.*cannot be applied',
-        'error_identifier_expected': r'<identifier> expected',
-        'error_illegal_start_of_type': r'illegal start of type'
-    }
-    
+    snapshots = [data.error_snapshot] if data.error_snapshot else []
+    total_submissions = data.submission_count if data.submission_count else len(snapshots)
+    return aggregate_and_prepare_data(snapshots, total_submissions)
+
+def aggregate_and_prepare_data(error_history, total_submissions):
+    """Mengakumulasi error snapshot dan menyiapkan data fitur agregat."""
     error_counts = {key: 0 for key in weights.keys()}
-    
-    for line in data.error_snapshot.lower().split('\n'):
+    valid_snapshots = [snap for snap in error_history if isinstance(snap, str) and snap.strip()]
+
+    for snapshot in valid_snapshots:
+        lowered_snapshot = snapshot.lower()
         for error_type, pattern in patterns.items():
-            if re.search(pattern, line):
+            if re.search(pattern, lowered_snapshot):
                 error_counts[error_type] += 1
-    
-    total_error_types = sum(1 for count in error_counts.values() if count > 0)
+
     weighted_score = sum(error_counts[k] * v for k, v in weights.items())
-    
-    error_submission_ratio = total_error_types / data.submission_count if data.submission_count > 0 else 0
+    total_error_types = sum(1 for count in error_counts.values() if count > 0)
+
+    derived_submissions = total_submissions if total_submissions and total_submissions > 0 else len(valid_snapshots)
+    if derived_submissions <= 0:
+        derived_submissions = 1
+
+    error_submission_ratio = total_error_types / derived_submissions if derived_submissions else 0
 
     processed_data = {
         **error_counts,
         'weighted_error_score': weighted_score,
         'total_error_types': total_error_types,
         'error_submission_ratio': error_submission_ratio,
-        'total_submissions': data.submission_count
+        'total_submissions': derived_submissions
     }
     return processed_data
 

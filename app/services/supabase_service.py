@@ -29,6 +29,49 @@ def fetch_all_user_metrics():
         logger.error(f"Failed to fetch data from Supabase: {e}")
         return []
 
+def save_raw_error_snapshot(user_id, project_id, error_snapshot, code_snapshot=None):
+    """Menyimpan error snapshot mentah ke tabel ai_automated_feedbacks."""
+    try:
+        payload = {
+            "user_id": user_id,
+            "project_id": project_id,
+            "error_snapshot": error_snapshot,
+            "code_snapshot": code_snapshot if code_snapshot else {},
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        supabase.table("ai_automated_feedbacks").insert(payload).execute()
+        logger.info(f"Saved raw error snapshot for user {user_id}.")
+    except Exception as e:
+        logger.error(f"Failed to save raw error snapshot for user {user_id}: {e}")
+
+def fetch_user_error_history(user_id, batch_size: int = 1000):
+    """Mengambil seluruh riwayat error_snapshot untuk user tertentu."""
+    try:
+        records = []
+        start = 0
+        while True:
+            end = start + batch_size - 1
+            response = (
+                supabase
+                .table("ai_automated_feedbacks")
+                .select("error_snapshot, created_at")
+                .eq("user_id", user_id)
+                .order("created_at", desc=False)
+                .range(start, end)
+                .execute()
+            )
+            batch = response.data or []
+            records.extend(batch)
+            if len(batch) < batch_size:
+                break
+            start += batch_size
+
+        logger.info(f"Fetched {len(records)} error snapshots for user {user_id}.")
+        return records
+    except Exception as e:
+        logger.error(f"Failed to fetch error history for user {user_id}: {e}")
+        return []
+
 def save_feedback_and_metrics(user_id, project_id, error_snapshot, code_snapshot, processed_data, performance, cluster):
     """Menyimpan data feedback dan metrik pengguna ke Supabase."""
     try:

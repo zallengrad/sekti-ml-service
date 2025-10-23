@@ -1,10 +1,13 @@
 import os
-import re
 import logging
+from datetime import datetime, timezone
+from typing import List
+
 import pandas as pd
 from dotenv import load_dotenv
 from supabase import create_client, Client
-from datetime import datetime
+
+from app.services import prediction_service
 
 # Konfigurasi dasar
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -20,95 +23,88 @@ if not supabase_url or not supabase_key:
 
 supabase: Client = create_client(supabase_url, supabase_key)
 
-# Logika parsing error dengan kunci snake_case agar cocok dengan kolom database
-# --- PERUBAHAN DI SINI ---
-weights = {
-    'error_semicolon_expected': 1.0,
-    'error_identifier_expected': 1.5,
-    'error_cannot_find_symbol': 2.0,
-    'error_constructor': 2.5,
-    'error_runtime_exception': 2.0,
-    'error_illegal_start_of_type': 1.5
-}
-patterns = {
-    'error_cannot_find_symbol': r'cannot find symbol',
-    'error_semicolon_expected': r'; expected',
-    'error_runtime_exception': r'RuntimeException',
-    'error_constructor': r'constructor.*cannot be applied',
-    'error_identifier_expected': r'<identifier> expected',
-    'error_illegal_start_of_type': r'illegal start of type'
-}
-# --- AKHIR PERUBAHAN ---
+
+def aggregate_history(snapshots: List[str]) -> dict:
+    """Helper agar script migrasi memakai logika agregasi yang sama dengan endpoint."""
+    total_submissions = len(snapshots)
+    return prediction_service.aggregate_and_prepare_data(snapshots, total_submissions)
+
+
+def fetch_all_feedbacks(batch_size: int = 1000) -> List[dict]:
+    """Mengambil seluruh catatan feedback dari Supabase tanpa batas 1000 default."""
+    records: List[dict] = []
+    start = 0
+    while True:
+        end = start + batch_size - 1
+        response = (
+            supabase
+            .table("ai_automated_feedbacks")
+            .select("user_id, error_snapshot")
+            .range(start, end)
+            .execute()
+        )
+        batch = response.data or []
+        records.extend(batch)
+        if len(batch) < batch_size:
+            break
+        start += batch_size
+    return records
+
 
 def migrate_data():
     """
-    Fungsi utama untuk membaca data dari ai_automated_feedbacks,
-    memprosesnya, dan mengisikannya ke user_metrics.
+    Membaca seluruh riwayat error dari ai_automated_feedbacks, menghitung agregasi,
+    menjalankan prediksi performa, dan menyinkronkan hasilnya ke user_metrics.
     """
     logging.info("Memulai proses migrasi data historis...")
 
     try:
-        # ... (kode Anda untuk mengambil dan mengelompokkan data tetap sama) ...
-        # 1. Ambil semua data dari tabel feedback
-        response = supabase.table("ai_automated_feedbacks").select("user_id, error_snapshot").execute()
-        if not response.data:
+        prediction_service.load_model()
+
+        feedback_records = fetch_all_feedbacks()
+        if not feedback_records:
             logging.warning("Tidak ada data di tabel 'ai_automated_feedbacks'. Proses dihentikan.")
             return
 
-        feedbacks_df = pd.DataFrame(response.data)
+        feedbacks_df = pd.DataFrame(feedback_records)
         logging.info(f"Ditemukan {len(feedbacks_df)} total catatan feedback.")
 
-        # 2. Kelompokkan data berdasarkan user_id
         grouped_by_user = feedbacks_df.groupby('user_id')
-        
-        all_metrics_to_upsert = []
 
+        upserts = []
         logging.info(f"Memproses data untuk {len(grouped_by_user)} pengguna unik...")
 
-        # 3. Proses setiap pengguna
         for user_id, user_feedbacks in grouped_by_user:
-            
-            total_error_counts = {key: 0 for key in weights.keys()}
-            
-            total_submissions = len(user_feedbacks)
+            snapshots = [
+                snapshot for snapshot in user_feedbacks['error_snapshot'].tolist()
+                if isinstance(snapshot, str) and snapshot.strip()
+            ]
 
-            for index, row in user_feedbacks.iterrows():
-                error_snapshot = row['error_snapshot']
-                if not error_snapshot or not isinstance(error_snapshot, str):
-                    continue
-                
-                for error_type, pattern in patterns.items():
-                    if re.search(pattern, error_snapshot.lower()):
-                        total_error_counts[error_type] += 1
-            
-            # 4. Hitung fitur agregat untuk pengguna ini
-            weighted_score = sum(total_error_counts[k] * v for k, v in weights.items())
-            total_error_types = sum(1 for count in total_error_counts.values() if count > 0)
-            error_submission_ratio = total_error_types / total_submissions if total_submissions > 0 else 0
-            
-            # Siapkan data untuk di-upsert
+            if not snapshots:
+                logging.debug(f"Melewati user {user_id} karena tidak ada snapshot valid.")
+                continue
+
+            processed_data = aggregate_history(snapshots)
+            performance, cluster = prediction_service.predict_performance(processed_data)
+
             metric_data = {
                 "user_id": user_id,
-                **total_error_counts,
-                "weighted_error_score": weighted_score,
-                "total_error_types": total_error_types,
-                "error_submission_ratio": error_submission_ratio,
-                "total_submissions": total_submissions,
-                # --- PERBAIKAN DI SINI ---
-                "updated_at": datetime.now().isoformat()
-                # --- AKHIR PERBAIKAN ---
+                "performance": performance,
+                "cluster": cluster,
+                **processed_data,
+                "updated_at": datetime.now(timezone.utc).isoformat()
             }
-            all_metrics_to_upsert.append(metric_data)
-        
-        # 5. Simpan semua data yang sudah diproses ke user_metrics
-        if all_metrics_to_upsert:
-            logging.info(f"Menyimpan {len(all_metrics_to_upsert)} data metrik ke tabel 'user_metrics'...")
-            supabase.table("user_metrics").upsert(all_metrics_to_upsert).execute()
-        
-        logging.info("🎉 Migrasi data berhasil diselesaikan!")
+            upserts.append(metric_data)
+
+        if upserts:
+            logging.info(f"Menyimpan {len(upserts)} data metrik ke tabel 'user_metrics'...")
+            supabase.table("user_metrics").upsert(upserts).execute()
+
+        logging.info("Migrasi data selesai.")
 
     except Exception as e:
         logging.error(f"Terjadi kesalahan selama migrasi: {e}")
+
 
 if __name__ == "__main__":
     migrate_data()
