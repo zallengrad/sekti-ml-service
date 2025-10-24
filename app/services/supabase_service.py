@@ -3,6 +3,7 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 import logging
 from datetime import datetime, timezone # Pastikan ini di-import
+from typing import Optional
 
 # Muat environment variables dari file .env
 load_dotenv()
@@ -72,6 +73,22 @@ def fetch_user_error_history(user_id, batch_size: int = 1000):
         logger.error(f"Failed to fetch error history for user {user_id}: {e}")
         return []
 
+
+def record_user_metrics_history(user_id: str, performance, cluster, metrics: Optional[dict] = None):
+    """Menyimpan snapshot metrik ke tabel user_metrics_history."""
+    try:
+        snapshot = {
+            "user_id": user_id,
+            "performance": performance,
+            "cluster": cluster,
+            **(dict(metrics) if metrics else {}),
+            "recorded_at": datetime.now(timezone.utc).isoformat()
+        }
+        supabase.table("user_metrics_history").insert(snapshot).execute()
+        logger.info(f"Recorded metrics history for user {user_id}.")
+    except Exception as e:
+        logger.error(f"Failed to record metrics history for user {user_id}: {e}")
+
 def save_feedback_and_metrics(user_id, project_id, error_snapshot, code_snapshot, processed_data, performance, cluster):
     """Menyimpan data feedback dan metrik pengguna ke Supabase."""
     try:
@@ -84,6 +101,12 @@ def save_feedback_and_metrics(user_id, project_id, error_snapshot, code_snapshot
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
         supabase.table("user_metrics").upsert(metric_data).execute()
+        record_user_metrics_history(
+            user_id=user_id,
+            performance=performance,
+            cluster=cluster,
+            metrics=processed_data
+        )
         
         logger.info(f"Successfully saved metrics for user {user_id} to Supabase.")
 

@@ -153,14 +153,37 @@ def retrain_model():
     logger.info(f"Model successfully retrained with {optimal_k} clusters and saved to {MODEL_PATH}.")
 
     updates = []
+    metrics_columns = list(weights.keys()) + [
+        'weighted_error_score',
+        'total_error_types',
+        'error_submission_ratio',
+        'total_submissions'
+    ]
+
     for index, row in df.iterrows():
+        new_performance = perf_map.get(row['Cluster'])
         updates.append({
             'user_id': row['user_id'],
             'cluster': int(row['Cluster']),
-            'performance': perf_map.get(row['Cluster']),
+            'performance': new_performance,
             # == PERBAIKAN UTAMA: Menambahkan timestamp secara eksplisit ==
             'updated_at': datetime.now(timezone.utc).isoformat()
         })
+        previous_performance = row.get('performance')
+        if previous_performance != new_performance:
+            metrics_snapshot = {}
+            for column in metrics_columns:
+                if column in df.columns:
+                    value = row[column]
+                    if isinstance(value, (np.generic,)):
+                        value = value.item()
+                    metrics_snapshot[column] = value
+            supabase_service.record_user_metrics_history(
+                user_id=row['user_id'],
+                performance=new_performance,
+                cluster=int(row['Cluster']),
+                metrics=metrics_snapshot
+            )
     
     if updates:
         logger.info(f"Updating cluster and performance for {len(updates)} users in the database...")
