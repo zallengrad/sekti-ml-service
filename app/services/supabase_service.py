@@ -96,8 +96,7 @@ def save_feedback_and_metrics(user_id, project_id, error_snapshot, code_snapshot
             "user_id": user_id,
             "performance": performance,
             "cluster": cluster,
-            **processed_data,
-            # == PERBAIKAN UTAMA ADA DI SINI ==
+            **processed_data, # <-- Ini akan memasukkan semua kolom baru secara otomatis
             "updated_at": datetime.now(timezone.utc).isoformat()
         }
         supabase.table("user_metrics").upsert(metric_data).execute()

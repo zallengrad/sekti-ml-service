@@ -59,7 +59,10 @@ def parse_and_prepare_data(data):
     return aggregate_and_prepare_data(snapshots, total_submissions)
 
 def aggregate_and_prepare_data(error_history, total_submissions):
-    """Mengakumulasi error snapshot dan menyiapkan data fitur agregat."""
+    """
+    Mengakumulasi error snapshot dan menyiapkan data fitur agregat
+    sesuai dengan format databaru2.xlsx dan skema database (snake_case).
+    """
     error_counts = {key: 0 for key in weights.keys()}
     valid_snapshots = [snap for snap in error_history if isinstance(snap, str) and snap.strip()]
 
@@ -68,23 +71,42 @@ def aggregate_and_prepare_data(error_history, total_submissions):
         for error_type, pattern in patterns.items():
             if re.search(pattern, lowered_snapshot):
                 error_counts[error_type] += 1
+    
+    total_error_submissions = len(valid_snapshots)
+
+    total_5_jenis_error = (
+        error_counts.get('error_cannot_find_symbol', 0) +
+        error_counts.get('error_semicolon_expected', 0) +
+        error_counts.get('error_runtime_exception', 0) +
+        error_counts.get('error_constructor', 0) +
+        error_counts.get('error_identifier_expected', 0)
+    )
 
     weighted_score = sum(error_counts[k] * v for k, v in weights.items())
     total_error_types = sum(1 for count in error_counts.values() if count > 0)
+    error_submission_ratio = total_error_types / total_error_submissions if total_error_submissions > 0 else 0
 
-    derived_submissions = total_submissions if total_submissions and total_submissions > 0 else len(valid_snapshots)
-    if derived_submissions <= 0:
-        derived_submissions = 1
-
-    error_submission_ratio = total_error_types / derived_submissions if derived_submissions else 0
-
+    # --- PERUBAHAN UTAMA ADA DI SINI (Kunci diubah ke snake_case) ---
     processed_data = {
-        **error_counts,
+        "total_error_submissions": total_error_submissions,
+        "jumlah_feedback_dibutuhkan": total_error_submissions,
+        "feedback_easy": 0,
+        "feedback_medium": 0,
+        "feedback_hard": 0,
+        "error_cannot_find_symbol": error_counts.get('error_cannot_find_symbol', 0),
+        "error_semicolon_expected": error_counts.get('error_semicolon_expected', 0),
+        "error_runtime_exception": error_counts.get('error_runtime_exception', 0),
+        "error_constructor": error_counts.get('error_constructor', 0),
+        "error_identifier_expected": error_counts.get('error_identifier_expected', 0),
+        # Pastikan Anda punya kolom ini di skema Prisma
+        "error_illegal_start_of_type": error_counts.get('error_illegal_start_of_type', 0), 
+        "total_5_jenis_error": total_5_jenis_error,
+
         'weighted_error_score': weighted_score,
         'total_error_types': total_error_types,
-        'error_submission_ratio': error_submission_ratio,
-        'total_submissions': derived_submissions
+        'error_submission_ratio': error_submission_ratio
     }
+    
     return processed_data
 
 def predict_performance(processed_data):
@@ -146,7 +168,7 @@ def retrain_model():
     
     # == PERBAIKAN: Menggunakan nama kolom snake_case yang konsisten ==
     cluster_order = df.groupby('Cluster')['weighted_error_score'].mean().sort_values().index
-    labels = ['High', 'Medium', 'Low']
+    labels = ['HIGH', 'MEDIUM', 'LOW']
     perf_map = {cluster_id: labels[i] for i, cluster_id in enumerate(cluster_order) if i < len(labels)}
     
     joblib.dump((scaler, kmeans, perf_map, error_cols), MODEL_PATH)
