@@ -4,19 +4,18 @@ import os
 import logging
 from datetime import datetime, timezone
 from typing import List, Dict
-
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
 # Impor layanan prediksi Anda yang sudah diperbarui
 from app.services import prediction_service
+from app.services import supabase_service # Impor juga supabase_service
 
-# Konfigurasi dasar logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 load_dotenv()
 
-# Inisialisasi Supabase Client
 supabase_url = os.environ.get("SUPABASE_URL")
 supabase_key = os.environ.get("SUPABASE_KEY")
 
@@ -26,116 +25,102 @@ if not supabase_url or not supabase_key:
 
 supabase: Client = create_client(supabase_url, supabase_key)
 
-def fetch_all_feedbacks(batch_size: int = 1000) -> List[Dict]:
+def migrate_and_reconstruct_eq_history():
     """
-    Mengambil seluruh catatan feedback dari Supabase, diurutkan berdasarkan pengguna dan waktu.
-    PENTING: Mengambil `created_at` untuk merekonstruksi riwayat.
+    Membaca SELURUH riwayat feedback, membangun kembali riwayat EQ per sesi
+    untuk eq_metrics_history, dan menyinkronkan data agregat TERAKHIR ke eq_metrics.
     """
-    records: List[Dict] = []
-    start = 0
-    while True:
-        end = start + batch_size - 1
-        response = (
-            supabase
-            .table("ai_automated_feedbacks")
-            .select("user_id, error_snapshot, created_at")
-            .order("user_id")
-            .order("created_at", desc=False) # Urutkan dari yang terlama ke terbaru
-            .range(start, end)
-            .execute()
-        )
-        batch = response.data or []
-        records.extend(batch)
-        if len(batch) < batch_size:
-            break
-        start += batch_size
-    logging.info(f"Mengambil {len(records)} total feedback dari database.")
-    return records
-
-def migrate_and_reconstruct_history():
-    """
-    Membaca SELURUH riwayat error, membangun kembali data historis untuk 
-    user_metrics_history, dan menyinkronkan data TERAKHIR ke user_metrics.
-    """
-    logging.info("Memulai proses migrasi dan rekonstruksi riwayat...")
+    logging.info("Memulai proses migrasi dan rekonstruksi riwayat EQ...")
 
     try:
-        # 1. Muat model untuk mendapatkan prediksi
+        # 1. Muat model (diperlukan untuk mapping performa akhir)
+        #    Jika model belum ada, ini akan menginisialisasi yang baru.
+        #    Retraining sebenarnya akan dilakukan *setelah* data historis dihitung.
         prediction_service.load_model()
-        logging.info("Model ML berhasil dimuat.")
+        logging.info("Model ML (akan dilatih ulang nanti) berhasil dimuat/diinisialisasi.")
 
-        # 2. Ambil semua data mentah
-        feedback_records = fetch_all_feedbacks()
-        if not feedback_records:
+        # 2. Ambil semua data mentah feedback
+        all_feedback_records = supabase_service.fetch_all_raw_feedbacks()
+        if not all_feedback_records:
             logging.warning("Tidak ada data di 'ai_automated_feedbacks'. Proses dihentikan.")
             return
 
-        feedbacks_df = pd.DataFrame(feedback_records)
+        feedbacks_df = pd.DataFrame(all_feedback_records)
         grouped_by_user = feedbacks_df.groupby('user_id')
 
-        final_user_metrics = []
-        all_history_records = []
-        
+        final_user_eq_metrics = [] # Untuk tabel eq_metrics
+        all_history_records = []   # Untuk tabel eq_metrics_history
+
         logging.info(f"Memproses data untuk {len(grouped_by_user)} pengguna unik...")
 
-        # 3. Iterasi per pengguna untuk membangun riwayat
-        for user_id, user_feedbacks in grouped_by_user:
-            # Pastikan diurutkan berdasarkan waktu
-            user_feedbacks = user_feedbacks.sort_values(by='created_at').reset_index()
-            
-            # List untuk menyimpan snapshot error pengguna secara bertahap
-            cumulative_snapshots = []
-            
-            for index, row in user_feedbacks.iterrows():
-                # Tambahkan snapshot saat ini ke riwayat kumulatif
-                snapshot = row['error_snapshot']
-                if isinstance(snapshot, str) and snapshot.strip():
-                    cumulative_snapshots.append(snapshot)
+        # 3. Iterasi per pengguna untuk membangun riwayat EQ
+        for user_id, user_feedbacks_df in grouped_by_user:
+            user_history = user_feedbacks_df.to_dict('records')
+            sessions = prediction_service.group_into_sessions(user_history) # Gunakan fungsi dari service
 
-                # Hitung metrik berdasarkan riwayat HINGGA SAAT INI
-                total_submissions = len(cumulative_snapshots)
-                processed_data = prediction_service.aggregate_and_prepare_data(
-                    cumulative_snapshots, 
-                    total_submissions
-                )
-                
-                # Lakukan prediksi performa
-                performance, cluster = prediction_service.predict_performance(processed_data)
+            cumulative_session_eqs = [] # Lacak skor EQ sesi untuk rata-rata kumulatif
 
-                # Siapkan data untuk tabel riwayat (user_metrics_history)
-                history_record = {
+            for i, session in enumerate(sessions):
+                session_eq = prediction_service.calculate_session_eq(session) # Gunakan fungsi dari service
+                if session_eq is not None:
+                    # Dapatkan detail sesi
+                    try:
+                        session_start = datetime.fromisoformat(session[0]['created_at'].replace('Z', '+00:00'))
+                        session_end = datetime.fromisoformat(session[-1]['created_at'].replace('Z', '+00:00'))
+                    except (IndexError, KeyError, ValueError) as e:
+                         logging.warning(f"Gagal memproses timestamp sesi untuk user {user_id}: {e}. Melewati sesi.")
+                         continue
+
+                    session_id = f"{user_id}_{session_start.timestamp()}"
+                    cumulative_session_eqs.append(session_eq)
+                    cumulative_avg_eq = np.mean(cumulative_session_eqs) if cumulative_session_eqs else 0.0
+
+                    # Siapkan data untuk tabel riwayat (eq_metrics_history)
+                    # Cluster & Performance belum diketahui saat ini
+                    history_record = {
+                        "user_id": user_id,
+                        "session_id": session_id,
+                        "session_start_time": session_start.isoformat(),
+                        "session_end_time": session_end.isoformat(),
+                        "session_event_count": len(session),
+                        "session_eq_score": session_eq,
+                        "cumulative_average_eq_score": cumulative_avg_eq,
+                        "cluster": None, # Akan diisi setelah retraining
+                        "performance": None, # Akan diisi setelah retraining
+                        "recorded_at": session_end.isoformat() # Gunakan waktu akhir sesi
+                    }
+                    all_history_records.append(history_record)
+
+            # Setelah iterasi sesi selesai, hitung metrik agregat terakhir pengguna
+            if cumulative_session_eqs:
+                final_avg_eq = np.mean(cumulative_session_eqs)
+                final_metric = {
                     "user_id": user_id,
-                    "performance": performance,
-                    "cluster": cluster,
-                    **processed_data,
-                    "recorded_at": row['created_at'] # <-- MENGGUNAKAN TIMESTAMP ASLI
+                    "average_eq_score": float(final_avg_eq),
+                    "total_sessions": len(cumulative_session_eqs),
+                    "cluster": None,      # Akan diisi setelah retraining
+                    "performance": None,  # Akan diisi setelah retraining
+                    # updated_at akan diisi saat upsert/retraining nanti
                 }
-                all_history_records.append(history_record)
+                final_user_eq_metrics.append(final_metric)
 
-            # Setelah iterasi selesai, `history_record` terakhir adalah metrik terbaru pengguna
-            if 'history_record' in locals():
-                latest_metric = history_record.copy()
-                # Ganti 'recorded_at' dengan 'updated_at' untuk tabel utama
-                latest_metric['updated_at'] = latest_metric.pop('recorded_at')
-                final_user_metrics.append(latest_metric)
+        # 4. Simpan metrik agregat (tanpa cluster/perf) ke eq_metrics sementara
+        if final_user_eq_metrics:
+            logging.info(f"Menyimpan {len(final_user_eq_metrics)} metrik EQ agregat awal ke 'eq_metrics'...")
+            # Gunakan upsert untuk menangani pengguna yang mungkin sudah ada
+            for metric in final_user_eq_metrics:
+                metric['updated_at'] = datetime.now(timezone.utc).isoformat()
+            supabase_service.upsert_eq_metrics_batch(final_user_eq_metrics)
 
-        # 4. Hapus data lama dan simpan data baru yang sudah direkonstruksi
-        if all_history_records:
-            logging.info("Menghapus data lama dari 'user_metrics_history'...")
-            supabase.table("user_metrics_history").delete().neq("user_id", "0").execute()
-            
-            logging.info(f"Menyimpan {len(all_history_records)} rekaman baru ke 'user_metrics_history'...")
-            supabase.table("user_metrics_history").insert(all_history_records).execute()
+        # 5. Lakukan Retraining Model berdasarkan metrik agregat yang baru dihitung
+        logging.info("Memulai retraining model berdasarkan metrik EQ yang direkonstruksi...")
+        prediction_service.retrain_model() # Fungsi retrain akan mengambil data dari DB, melatih, dan mengupdate cluster/perf di eq_metrics dan eq_metrics_history
 
-        if final_user_metrics:
-            logging.info(f"Menyimpan/memperbarui {len(final_user_metrics)} data metrik terbaru ke 'user_metrics'...")
-            supabase.table("user_metrics").upsert(final_user_metrics).execute()
-
-        logging.info("✅ Migrasi dan rekonstruksi riwayat selesai dengan sukses.")
+        logging.info("✅ Migrasi, rekonstruksi riwayat EQ, dan retraining model selesai dengan sukses.")
 
     except Exception as e:
-        logging.error(f"❌ Terjadi kesalahan selama migrasi: {e}", exc_info=True)
+        logging.error(f"❌ Terjadi kesalahan selama migrasi EQ: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
-    migrate_and_reconstruct_history()
+    migrate_and_reconstruct_eq_history()
